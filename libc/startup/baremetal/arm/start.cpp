@@ -14,15 +14,18 @@
 #include "src/string/memset.h"
 #include "startup/baremetal/fini.h"
 #include "startup/baremetal/init.h"
+#include "semihost.h"
 
 #include <arm_acle.h> // For __arm_wsr
+#include <stddef.h>
+#include <time.h>
 
 extern "C" {
 int main(int argc, char **argv);
 void _start();
 
-// Semihosting library initialisation if applicable. Required for printf, etc.
-[[gnu::weak]] void _platform_init() {}
+// Semihosting library initialisation. Required for printf, etc.
+extern "C" void _platform_init(void);
 
 // These symbols are provided by the linker. The exact names are not defined by
 // a standard.
@@ -189,3 +192,96 @@ void _start() {
   asm volatile("bl %0" : : "X"(LIBC_NAMESPACE::do_start));
 }
 } // extern "C"
+
+// IO and time retargetting to sehimosting for libc testing
+
+namespace {
+
+void stdio_open(struct __llvm_libc_stdio_cookie *cookie, size_t mode) {
+  size_t args[3];
+  args[0] = reinterpret_cast<size_t>(":tt");
+  args[1] = mode;
+  args[2] = static_cast<size_t>(3); /* name length */
+  cookie->handle = semihosting_call(SYS_OPEN, args);
+}
+} // namespace
+
+extern "C" {
+
+void __llvm_libc_exit(int status) {
+
+#if defined(__ARM_64BIT_STATE) && __ARM_64BIT_STATE
+  size_t block[2];
+  block[0] = ADP_Stopped_ApplicationExit;
+  block[1] = status;
+  semihosting_call(SYS_EXIT, block);
+#else
+  if (status == 0) {
+    semihosting_call(
+        SYS_EXIT, reinterpret_cast<const void *>(ADP_Stopped_ApplicationExit));
+  } else {
+    semihosting_call(SYS_EXIT, reinterpret_cast<const void *>(
+                                   ADP_Stopped_RunTimeErrorUnknown));
+  }
+#endif
+
+  __builtin_unreachable(); /* semihosting call doesn't return */
+}
+
+ssize_t __llvm_libc_stdio_read(struct __llvm_libc_stdio_cookie *cookie,
+                               const char *buf, size_t size) {
+  size_t args[4];
+  args[0] = static_cast<size_t>(cookie->handle);
+  args[1] = reinterpret_cast<size_t>(buf);
+  args[2] = size;
+  args[3] = 0;
+  ssize_t retval = semihosting_call(SYS_READ, args);
+  if (retval >= 0)
+    retval = size - retval;
+  return retval;
+}
+
+ssize_t __llvm_libc_stdio_write(struct __llvm_libc_stdio_cookie *cookie,
+                                const char *buf, size_t size) {
+  size_t args[4];
+  args[0] = static_cast<size_t>(cookie->handle);
+  args[1] = reinterpret_cast<size_t>(buf);
+  args[2] = size;
+  ssize_t retval = semihosting_call(SYS_WRITE, args);
+  if (retval >= 0)
+    retval = size - retval;
+  return retval;
+}
+
+struct __llvm_libc_stdio_cookie __llvm_libc_stdin_cookie;
+struct __llvm_libc_stdio_cookie __llvm_libc_stdout_cookie;
+struct __llvm_libc_stdio_cookie __llvm_libc_stderr_cookie;
+
+bool __llvm_libc_timespec_get_active(struct timespec *ts) {
+  long retval = semihosting_call(SYS_CLOCK, 0);
+  if (retval == -1)
+    return false;
+
+  // Semihosting uses centiseconds
+  ts->tv_sec = (retval / 100);
+  ts->tv_nsec = (retval % 100) * (1'000'000'000 / 100);
+  return true;
+}
+
+bool __llvm_libc_timespec_get_utc(struct timespec *ts) {
+  long retval = semihosting_call(SYS_TIME, 0);
+
+  // Semihosting uses seconds
+  ts->tv_sec = retval;
+  ts->tv_nsec = 0;
+  return true;
+}
+
+// Entry point
+void _platform_init(void) {
+  stdio_open(&__llvm_libc_stdin_cookie, OPENMODE_R);
+  stdio_open(&__llvm_libc_stdout_cookie, OPENMODE_W);
+  stdio_open(&__llvm_libc_stderr_cookie, OPENMODE_W);
+}
+} // extern "C"
+
